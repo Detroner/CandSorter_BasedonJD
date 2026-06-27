@@ -149,7 +149,7 @@ def rank_candidates(
     jd_path: str | Path,
     out_path: str | Path,
     validator_path: str | Path | None = None,
-    top_n: int = 100_000,  # changed: default covers full 100k dataset
+    top_n: int = 100,  # changed: default covers full 100k dataset
 ) -> list[Dict[str, Any]]:
     del validator_path
     start = time.time()
