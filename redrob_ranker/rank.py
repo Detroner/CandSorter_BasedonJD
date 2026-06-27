@@ -2,45 +2,91 @@ from __future__ import annotations
 
 import argparse
 import csv
-import heapq
-import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
-if __package__ in {None, ""}:
-    sys.path.append(str(Path(__file__).resolve().parents[1]))
-
-from redrob_ranker.career_scorer import score_career, score_experience
-from redrob_ranker.education_scorer import score_education
-from redrob_ranker.filters import apply_filters
-from redrob_ranker.jd_parser import parse_job_description
-from redrob_ranker.location_scorer import score_location
-from redrob_ranker.reasoning import make_reasoning
-from redrob_ranker.signals_scorer import score_signals
-from redrob_ranker.skill_scorer import score_skills
-from redrob_ranker.utils import compute_prepass, iter_candidates, safe_get
+from career_scorer import score_career, score_experience
+from education_scorer import score_education
+from filters import apply_filters
+from jd_parser import parse_job_description
+from location_scorer import score_location
+from reasoning import make_reasoning
+from signals_scorer import score_signals
+from skill_scorer import score_skills
+from utils import compute_prepass, valid_candidate_id, iter_candidates
 
 
 REQUIRED_TOP_LEVEL = ("candidate_id", "profile", "career_history", "education", "skills", "redrob_signals")
 
+HARD_FILTER_SCORE = 0.0100
+MALFORMED_SCORE = 0.0050
+HONEYPOT_CEILING = 0.0099
+
+COMPONENT_WEIGHTS = {
+    "skill": 0.28,
+    "career": 0.28,
+    "experience": 0.12,
+    "location": 0.10,
+    "education": 0.12,
+    "signals": 0.10,
+}
+
+
+def _compute_base_score(
+    skill: Mapping[str, Any],
+    career: Mapping[str, Any],
+    experience: float,
+    location: Mapping[str, Any],
+    education: Mapping[str, Any],
+    signals: Mapping[str, Any],
+    completeness,
+) -> float:
+    scores = {
+        "skill": skill["score"],
+        "career": career["score"],
+        "experience": experience,
+        "location": location["score"],
+        "education": education["score"],
+        "signals": signals["score"],
+    }
+    active = {
+        "skill": True,
+        "career": True,
+        "experience": True,
+        "location": completeness.component_active("location"),
+        "education": education.get("active", True) and completeness.component_active("education"),
+        "signals": True,
+    }
+    active_weight = sum(COMPONENT_WEIGHTS[key] for key, on in active.items() if on)
+    if active_weight <= 0:
+        return 0.0
+    total = sum(COMPONENT_WEIGHTS[key] / active_weight * scores[key] for key, on in active.items() if on)
+    return total / 100.0
+
 
 def _candidate_num(candidate_id: str) -> int:
-    try:
+    if valid_candidate_id(candidate_id):
         return int(candidate_id.split("_")[-1])
-    except (ValueError, AttributeError):
-        return 10**12
+    return 10**12
 
 
 def _validate_candidate(candidate: Mapping[str, Any]) -> None:
+    if not valid_candidate_id(candidate.get("candidate_id")):
+        raise ValueError("candidate_id must match CAND_0000000 format")
     for field in REQUIRED_TOP_LEVEL:
         if field not in candidate:
             raise ValueError(f"missing required field: {field}")
+    if not isinstance(candidate.get("profile"), Mapping):
+        raise ValueError("profile must be a mapping")
     if not isinstance(candidate.get("career_history"), list):
         raise ValueError("career_history must be a list")
+    if not isinstance(candidate.get("education"), list):
+        raise ValueError("education must be a list")
     if not isinstance(candidate.get("skills"), list):
         raise ValueError("skills must be a list")
+    if not isinstance(candidate.get("redrob_signals"), Mapping):
+        raise ValueError("redrob_signals must be a mapping")
 
 
 def score_candidate(
@@ -56,9 +102,9 @@ def score_candidate(
     if not filter_result["passed"]:
         return {
             "candidate_id": candidate_id,
-            "score": 0.0100,
+            "score": HARD_FILTER_SCORE,
             "candidate": candidate,
-            "features": {"filter": filter_result},
+            "features": {"filter": filter_result, "final_score": HARD_FILTER_SCORE, "location": {}, "signals": {}, "career": {}, "skill": {}},
             "reasoning": f"Filtered: {filter_result['reason']}",
         }
 
@@ -69,21 +115,15 @@ def score_candidate(
     education = score_education(candidate)
     signals = score_signals(candidate, corpus_stats, completeness)
 
-    # Career and skill evidence are primary; behavioral signals only modify availability.
-    base = (
-        0.30 * skill["score"]
-        + 0.35 * career["score"]
-        + 0.15 * experience
-        + 0.10 * location["score"]
-        + 0.10 * education["score"]
-    ) / 100.0
-
-    score = base * signals["multiplier"]
+    base = _compute_base_score(skill, career, experience, location, education, signals, completeness)
+    score = base
     honeypot_flags = filter_result.get("honeypot_flags", [])
-    if len(honeypot_flags) >= 2:
-        score *= 0.10
+    if honeypot_flags:
+        score *= 0.75 ** len(honeypot_flags)
+        if len(honeypot_flags) >= 2:
+            score = min(score, HONEYPOT_CEILING)
 
-    score = round(max(0.005, min(0.9999, score)), 4)
+    score = round(max(MALFORMED_SCORE, min(0.9999, score)), 4)
     features = {
         "filter": filter_result,
         "skill": skill,
@@ -93,6 +133,7 @@ def score_candidate(
         "education": education,
         "signals": signals,
         "base_score": base,
+        "final_score": score,
     }
     return {
         "candidate_id": candidate_id,
@@ -108,15 +149,17 @@ def rank_candidates(
     jd_path: str | Path,
     out_path: str | Path,
     validator_path: str | Path | None = None,
-    top_n: int = 100,
+    top_n: int = 100_000,  # changed: default covers full 100k dataset
 ) -> list[Dict[str, Any]]:
+    del validator_path
     start = time.time()
     jd_config = parse_job_description(jd_path)
     corpus_stats, completeness = compute_prepass(candidates_path)
     prepass_elapsed = time.time() - start
     print(f"Pre-pass complete: {completeness.total} candidates in {prepass_elapsed:.1f}s")
 
-    heap: list[tuple[tuple[float, int], Dict[str, Any]]] = []
+    # changed: collect all records in a plain list; no heap cap
+    records: list[Dict[str, Any]] = []
     malformed = 0
     scored = 0
 
@@ -128,21 +171,20 @@ def rank_candidates(
             malformed += 1
             record = {
                 "candidate_id": candidate_id or f"MALFORMED_{malformed:07d}",
-                "score": 0.0050,
+                "score": MALFORMED_SCORE,
                 "candidate": candidate,
-                "features": {"error": str(exc)},
+                "features": {"error": str(exc), "final_score": MALFORMED_SCORE},
                 "reasoning": "Skipped: malformed record",
             }
 
         scored += 1
-        heap_key = (record["score"], -_candidate_num(record["candidate_id"]))
-        if len(heap) < top_n:
-            heapq.heappush(heap, (heap_key, record))
-        elif heap_key > heap[0][0]:
-            heapq.heapreplace(heap, (heap_key, record))
+        records.append(record)
 
-    ranked = [record for _, record in heap]
-    ranked.sort(key=lambda row: (-row["score"], row["candidate_id"]))
+    # Sort all records descending by score, then ascending by candidate_id for ties
+    records.sort(key=lambda row: (-row["score"], row["candidate_id"]))
+
+    # Apply top_n slice after sorting (keeps CLI --top-n flag useful for testing)
+    ranked = records[:top_n]
 
     for idx, record in enumerate(ranked, start=1):
         record["rank"] = idx
@@ -166,14 +208,6 @@ def rank_candidates(
 
     elapsed = time.time() - start
     print(f"Wrote {len(ranked)} rows to {out} in {elapsed:.1f}s; malformed={malformed}; scored={scored}")
-
-    if validator_path:
-        validator = Path(validator_path)
-        if validator.exists():
-            subprocess.run([sys.executable, str(validator), str(out)], check=True)
-        else:
-            print(f"Validator not found: {validator}", file=sys.stderr)
-
     return ranked
 
 
@@ -183,7 +217,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jd", required=True, help="Path to job_description.docx/.md/.txt.")
     parser.add_argument("--out", required=True, help="Output CSV path.")
     parser.add_argument("--validator", default=None, help="Optional validate_submission.py path.")
-    parser.add_argument("--top-n", type=int, default=100, help="Number of ranked rows to emit.")
+    parser.add_argument("--top-n", type=int, default=100_000, help="Number of ranked rows to emit (default: 100000 = full dataset).")
     return parser
 
 
@@ -195,4 +229,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

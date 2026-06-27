@@ -2,17 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Mapping
 
-from .utils import DataCompletenessReport, days_since, safe_bool, safe_float, safe_get, safe_int, score_from_z
-
-
-def _missing(value: Any) -> bool:
-    return value is None or value == "" or value == {} or value == []
-
-
-def _field_multiplier(field: str, value: Any, completeness: DataCompletenessReport) -> float:
-    if not _missing(value):
-        return 1.0
-    return completeness.missing_penalty(field)
+from utils import DataCompletenessReport, days_since, safe_float, safe_get, score_from_z
 
 
 def score_signals(
@@ -21,93 +11,47 @@ def score_signals(
     completeness: DataCompletenessReport,
 ) -> Dict[str, Any]:
     signals = safe_get(candidate, "redrob_signals", default={}) or {}
-    multiplier = 1.0
-    notes = []
+    score = 50.0
+    note_parts = []
 
-    last_active = signals.get("last_active_date")
-    if _missing(last_active):
-        multiplier *= _field_multiplier("last_active_date", last_active, completeness)
-        active_days = 999
-    else:
-        active_days = days_since(last_active)
-        if active_days > 180:
-            multiplier *= 0.40
-            notes.append("inactive 180d+")
-        elif active_days > 90:
-            multiplier *= 0.70
-            notes.append("stale activity")
-        elif active_days > 30:
-            multiplier *= 0.85
-            notes.append("recent enough activity")
-        else:
-            notes.append("active recently")
+    response = safe_float(signals.get("recruiter_response_rate"), -1)
+    if response >= 0.60:
+        score += 10.0
+        note_parts.append("healthy recruiter response")
+    elif 0 <= response < 0.20:
+        score -= 8.0
+        note_parts.append("low recruiter response")
 
-    open_to_work = signals.get("open_to_work_flag")
-    if _missing(open_to_work):
-        multiplier *= _field_multiplier("open_to_work_flag", open_to_work, completeness)
-    elif not safe_bool(open_to_work):
-        multiplier *= 0.82
-        notes.append("not explicitly open")
-
-    response_rate = safe_float(signals.get("recruiter_response_rate"), -1)
-    if response_rate < 0:
-        multiplier *= _field_multiplier("recruiter_response_rate", signals.get("recruiter_response_rate"), completeness)
-    elif response_rate < 0.2 and active_days > 60:
-        multiplier *= 0.62
-        notes.append("low recruiter response")
-
-    interview_rate = safe_float(signals.get("interview_completion_rate"), -1)
-    if interview_rate >= 0 and interview_rate < 0.5:
-        multiplier *= 0.72
-        notes.append("low interview completion")
-
-    verified_email = signals.get("verified_email")
-    verified_phone = signals.get("verified_phone")
-    if not safe_bool(verified_email, True) and not safe_bool(verified_phone, True):
-        multiplier *= 0.72
-        notes.append("unverified contact")
-
-    applications = safe_int(signals.get("applications_submitted_30d"), 0)
-    if applications > 20 and 0 <= response_rate < 0.1:
-        multiplier *= 0.50
-        notes.append("high-application low-response pattern")
+    active_days = days_since(signals.get("last_active_date"), default=999)
+    if active_days <= 30:
+        score += 8.0
+        note_parts.append("active recently")
+    elif active_days > 120:
+        score -= 6.0
+        note_parts.append("stale platform activity")
 
     github = safe_float(signals.get("github_activity_score"), -1)
-    github_norm = 0.0
-    if github >= 0:
-        stats = corpus_stats.get("github_activity_score", {"mean": 0.0, "std": 1.0})
-        github_norm = score_from_z(github, stats["mean"], stats["std"])
+    github_missing = github <= 0
+    if github >= 60:
+        score += 6.0
+        note_parts.append("strong github activity")
+    elif github_missing and not completeness.component_active("github_activity_score"):
+        note_parts.append("github unavailable across corpus")
+    elif github > 0:
+        github_stats = corpus_stats.get("github_activity_score", {"mean": 0.0, "std": 1.0})
+        score += 10.0 * (score_from_z(github, github_stats["mean"], github_stats["std"]) - 0.6)
 
-    assessments = signals.get("skill_assessment_scores") or {}
-    if assessments:
-        assessment_norm = sum(max(0.0, min(100.0, safe_float(v))) for v in assessments.values()) / (100.0 * len(assessments))
-    else:
-        assessment_norm = 0.0
-    activity_cluster = max(github_norm, assessment_norm)
+    connections = safe_float(signals.get("connection_count"), -1)
+    if connections >= 0:
+        conn_stats = corpus_stats.get("connection_count", {"mean": 0.0, "std": 1.0})
+        score += 6.0 * (score_from_z(connections, conn_stats["mean"], conn_stats["std"]) - 0.6)
 
-    saved = safe_int(signals.get("saved_by_recruiters_30d"), 0)
-    appearances = safe_int(signals.get("search_appearance_30d"), 0)
-    engagement_cluster = max(min(1.0, saved / 10.0), min(1.0, appearances / 100.0))
+    if github_missing:
+        score *= completeness.missing_penalty("github_activity_score", mild=0.98, strong=0.95)
 
-    availability_cluster = 1.0 if safe_bool(open_to_work) or applications > 0 else 0.0
-
-    positive = 1.0 + min(0.08, activity_cluster * 0.04) + min(0.08, engagement_cluster * 0.05) + min(0.04, availability_cluster * 0.03)
-    multiplier = min(1.0, multiplier * positive)
-    multiplier = max(0.30, min(1.0, multiplier))
-
-    if saved > 5:
-        notes.append(f"{saved} recruiter saves")
-    elif github >= 60:
-        notes.append(f"GitHub {github:.0f}/100")
-    elif response_rate >= 0:
-        notes.append(f"response rate {response_rate:.2f}")
-
+    score = max(0.0, min(100.0, score))
     return {
-        "multiplier": multiplier,
+        "score": score,
+        "signal_note": ", ".join(note_parts) if note_parts else "limited behavioral signal",
         "active_days": active_days,
-        "activity_cluster": activity_cluster,
-        "engagement_cluster": engagement_cluster,
-        "availability_cluster": availability_cluster,
-        "signal_note": notes[0] if notes else "limited behavioral signal",
     }
-

@@ -1,2 +1,2 @@
-"""Rule-based Redrob candidate ranker."""
+"""Redrob candidate ranking package."""
 

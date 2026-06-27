@@ -2,73 +2,49 @@ from __future__ import annotations
 
 from typing import Any, Dict, Mapping
 
-from .utils import safe_bool, safe_get, safe_int
+from utils import safe_bool, safe_get, safe_int
 
 
-CITY_ALIASES = {
-    "delhi ncr": ["delhi", "new delhi", "gurgaon", "gurugram", "faridabad", "noida"],
-    "bangalore": ["bangalore", "bengaluru"],
-    "bengaluru": ["bangalore", "bengaluru"],
-}
-
-
-def _contains_city(location: str, city: str) -> bool:
-    loc = location.lower()
-    city_lower = city.lower()
-    if city_lower in loc:
-        return True
-    return any(alias in loc for alias in CITY_ALIASES.get(city_lower, []))
+PREFERRED_INDIAN_CITIES = {"pune", "noida", "hyderabad", "mumbai", "delhi", "gurgaon", "bangalore", "bengaluru"}
 
 
 def score_location(candidate: Mapping[str, Any], jd_config: Mapping[str, Any]) -> Dict[str, Any]:
     profile = safe_get(candidate, "profile", default={}) or {}
     signals = safe_get(candidate, "redrob_signals", default={}) or {}
-    location = str(profile.get("location", ""))
+    location = str(profile.get("location", "")).lower()
     country = str(profile.get("country", "")).lower()
+    raw_notice = signals.get("notice_period_days")
+    notice_days = safe_int(raw_notice, 180)
+    if notice_days < 0:
+        notice_days = 180
     willing = safe_bool(signals.get("willing_to_relocate"), False)
-    preferred = jd_config.get("preferred_locations", []) or []
-    acceptable = jd_config.get("acceptable_locations", []) or []
 
-    if any(_contains_city(location, city) for city in preferred):
-        loc_score = 100.0
-        location_note = "preferred location"
-    elif any(_contains_city(location, city) for city in acceptable):
-        loc_score = 82.0
-        location_note = "JD-welcome location"
-    elif country == "india" and willing:
-        loc_score = 65.0
-        location_note = "India-based and willing to relocate"
-    elif country == "india":
-        loc_score = 42.0
-        location_note = "India-based but relocation unclear"
+    score = 35.0
+    location_note = "location fit unclear"
+
+    if country == "india":
+        score = 80.0
+        location_note = "based in India"
+        if any(city in location for city in PREFERRED_INDIAN_CITIES):
+            score = 92.0
+            location_note = "preferred India location"
     elif willing:
-        loc_score = 18.0
+        score = 62.0
         location_note = "outside India but willing to relocate"
     else:
-        loc_score = 5.0
-        location_note = "outside India"
+        score = 5.0
+        location_note = "outside India without relocation"
 
-    notice = safe_int(signals.get("notice_period_days"), 180)
-    buyout = safe_int(jd_config.get("notice_buyout_days"), 30)
-    if notice <= buyout:
-        notice_score = 100.0
-        notice_note = "within buyout window"
-    elif notice <= 60:
-        notice_score = 72.0
-        notice_note = "moderate notice concern"
-    elif notice <= 90:
-        notice_score = 42.0
-        notice_note = "long notice concern"
+    max_notice = int(jd_config.get("max_notice_days", 30))
+    if notice_days <= max_notice:
+        score += 6.0
+    elif notice_days <= 60:
+        score -= 4.0
     else:
-        notice_score = 18.0
-        notice_note = "very long notice"
+        score -= 18.0
 
     return {
-        "score": 0.70 * loc_score + 0.30 * notice_score,
-        "location_score": loc_score,
-        "notice_score": notice_score,
+        "score": max(0.0, min(100.0, score)),
+        "notice_days": notice_days,
         "location_note": location_note,
-        "notice_note": notice_note,
-        "notice_days": notice,
     }
-

@@ -1,208 +1,115 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping
 
-from .utils import safe_float, safe_get, safe_int, title_is_engineering
+from utils import INTEREST_ONLY_PATTERNS, safe_get, safe_int
 
 
-SKILL_CLUSTERS = {
-    "retrieval": {
-        "weight": 25,
-        "terms": [
-            "sentence-transformers",
-            "sentence transformers",
-            "bge",
-            "e5",
-            "embedding",
-            "embeddings",
-            "semantic search",
-            "dense retrieval",
-            "rag",
-            "faiss",
-            "hnsw",
-            "ann",
-            "approximate nearest",
-            "retrieval",
-        ],
-    },
-    "vector_search": {
-        "weight": 20,
-        "terms": [
-            "pinecone",
-            "weaviate",
-            "qdrant",
-            "milvus",
-            "elasticsearch",
-            "opensearch",
-            "solr",
-            "vector database",
-            "vector db",
-            "hybrid search",
-        ],
-    },
-    "ranking_eval": {
-        "weight": 20,
-        "terms": [
-            "ndcg",
-            "mrr",
-            "map",
-            "ranking eval",
-            "offline eval",
-            "a/b testing",
-            "ab testing",
-            "experiment design",
-            "relevance",
-            "learning to rank",
-        ],
-    },
-    "python_production": {
-        "weight": 15,
-        "terms": [
-            "python",
-            "fastapi",
-            "flask",
-            "django",
-            "rest",
-            "api",
-            "kubernetes",
-            "docker",
-            "deployment",
-            "production",
-            "mlops",
-            "airflow",
-            "spark",
-        ],
-    },
-    "learning_to_rank": {
-        "weight": 10,
-        "terms": ["xgboost ranker", "lambdamart", "lambda mart", "ltr", "learning-to-rank", "ranknet"],
-    },
-    "llm_finetuning": {
-        "weight": 10,
-        "terms": ["lora", "qlora", "peft", "fine-tuning", "finetuning", "fine tuning", "llm"],
-    },
+CANONICAL_SKILLS = {
+    "python": {"python", "pyspark"},
+    "machine learning": {"machine learning", "ml"},
+    "nlp": {"nlp", "natural language processing"},
+    "retrieval": {"retrieval", "semantic search", "dense retrieval"},
+    "ranking": {"ranking", "learning to rank"},
+    "search": {"search", "enterprise search", "vector search"},
+    "recommendation": {"recommendation", "recommender system"},
+    "embeddings": {"embeddings", "embedding"},
+    "vector databases": {"qdrant", "weaviate", "pinecone", "milvus", "pgvector", "vector database", "vector db"},
+    "llm tooling": {"langchain", "llamaindex", "huggingface", "hugging face", "transformers", "fine-tuning llms", "lora"},
+    "deep learning": {"pytorch", "tensorflow", "keras"},
+    "search infrastructure": {"faiss", "elasticsearch", "elastic search", "solr", "lucene", "opensearch"},
+    "backend": {"backend", "flask", "fastapi", "django", "spring boot", "microservices", "rest apis", "rest api", "grpc"},
 }
 
-AI_SKILL_TERMS = {
-    "ai",
-    "ml",
+SUPPORTING_INFRA_SKILLS = {"airflow", "spark", "kafka", "beam", "apache beam", "dbt", "databricks", "hadoop"}
+CORE_MATCH_SKILLS = {
+    "python",
     "machine learning",
-    "deep learning",
     "nlp",
-    "llm",
-    "rag",
-    "computer vision",
-    "speech recognition",
-    "tensorflow",
-    "pytorch",
-    "transformers",
-    "langchain",
-    "openai",
-    "hugging face",
-    "fine-tuning",
+    "retrieval",
+    "ranking",
+    "search",
+    "recommendation",
     "embeddings",
+    "vector databases",
+    "llm tooling",
+    "deep learning",
+    "search infrastructure",
+    "backend",
 }
 
 
-def _match_terms(text: str, terms: Iterable[str]) -> bool:
-    return any(term in text for term in terms)
+def _normalize(name: str) -> str:
+    return " ".join(str(name or "").strip().lower().split())
 
 
-def _assessment_for(skill_name: str, assessments: Mapping[str, Any]) -> float | None:
-    skill_lower = skill_name.lower()
-    for key, value in assessments.items():
-        key_lower = str(key).lower()
-        if key_lower == skill_lower or key_lower in skill_lower or skill_lower in key_lower:
-            score = safe_float(value, -1)
-            if score >= 0:
-                return max(0.0, min(1.0, score / 100.0))
+def _canonical_for_skill(name: str) -> str | None:
+    norm = _normalize(name)
+    for canonical, aliases in CANONICAL_SKILLS.items():
+        if norm == canonical or norm in aliases:
+            return canonical
     return None
 
 
-def _skill_depth(skill: Mapping[str, Any], assessments: Mapping[str, Any]) -> float:
-    proficiency = str(skill.get("proficiency", "")).lower()
-    proficiency_weight = {
-        "beginner": 0.40,
-        "intermediate": 0.70,
-        "advanced": 0.90,
-        "expert": 1.00,
-    }.get(proficiency, 0.55)
-
-    assessment = _assessment_for(str(skill.get("name", "")), assessments)
-    if assessment is not None:
-        proficiency_weight = assessment
-
-    duration = safe_int(skill.get("duration_months"), 0)
-    if duration >= 36:
-        duration_weight = 1.00
-    elif duration >= 18:
-        duration_weight = 0.85
-    elif duration >= 6:
-        duration_weight = 0.60
-    else:
-        duration_weight = 0.30
-
-    endorsements = safe_int(skill.get("endorsements"), 0)
-    if endorsements >= 20:
-        endorsement_weight = 1.00
-    elif endorsements >= 6:
-        endorsement_weight = 0.85
-    elif endorsements >= 1:
-        endorsement_weight = 0.70
-    else:
-        endorsement_weight = 0.50
-
-    return (proficiency_weight + duration_weight + endorsement_weight) / 3.0
-
-
 def score_skills(candidate: Mapping[str, Any]) -> Dict[str, Any]:
-    skills = safe_get(candidate, "skills", default=[]) or []
-    signals = safe_get(candidate, "redrob_signals", default={}) or {}
-    assessments = signals.get("skill_assessment_scores") or {}
     profile = safe_get(candidate, "profile", default={}) or {}
+    summary = str(profile.get("summary", "")).lower()
+    listed_skills = safe_get(candidate, "skills", default=[]) or []
 
-    cluster_scores: Dict[str, float] = {}
-    matched_skills: List[str] = []
-    ai_skill_count = sum(
-        1
-        for skill in skills
-        if any(term in str(skill.get("name", "")).lower() for term in AI_SKILL_TERMS)
-    )
+    matched: List[str] = []
+    strong_evidence: List[str] = []
+    adjacent: List[str] = []
+    supporting_only: List[str] = []
 
-    for cluster_name, cluster in SKILL_CLUSTERS.items():
-        best_depth = 0.0
-        best_skill = ""
-        for skill in skills:
-            name = str(skill.get("name", ""))
-            lowered = name.lower()
-            if _match_terms(lowered, cluster["terms"]):
-                depth = _skill_depth(skill, assessments)
-                if depth > best_depth:
-                    best_depth = depth
-                    best_skill = name
-        if best_depth > 0:
-            cluster_scores[cluster_name] = best_depth * float(cluster["weight"])
-            if best_skill and best_skill not in matched_skills:
-                matched_skills.append(best_skill)
+    for skill in listed_skills:
+        name = str(skill.get("name", ""))
+        norm_name = _normalize(name)
+        if norm_name in SUPPORTING_INFRA_SKILLS:
+            if norm_name not in supporting_only:
+                supporting_only.append(norm_name)
+            continue
+
+        canonical = _canonical_for_skill(name)
+        if not canonical or canonical not in CORE_MATCH_SKILLS:
+            continue
+        if canonical not in matched:
+            matched.append(canonical)
+
+        duration = safe_int(skill.get("duration_months"), 0)
+        proficiency = str(skill.get("proficiency", "")).lower()
+        if duration >= 12 or proficiency in {"advanced", "expert"}:
+            if canonical not in strong_evidence:
+                strong_evidence.append(canonical)
         else:
-            cluster_scores[cluster_name] = 0.0
+            if canonical not in adjacent:
+                adjacent.append(canonical)
 
-    raw_score = sum(cluster_scores.values())
+    interest_only = any(pattern in summary for pattern in INTEREST_ONLY_PATTERNS)
 
-    all_skill_text = " ".join(str(s.get("name", "")) for s in skills).lower()
-    if "nlp" in all_skill_text or "natural language" in all_skill_text:
-        raw_score += 4.0
-        if "NLP" not in matched_skills:
-            matched_skills.append("NLP")
+    score = 0.0
+    if strong_evidence:
+        score += min(70.0, 18.0 * len(strong_evidence))
+    if adjacent:
+        score += min(10.0, 4.0 * len(adjacent))
+    if "python" in matched:
+        score += 8.0
+    if "machine learning" in strong_evidence or "nlp" in strong_evidence or "deep learning" in strong_evidence:
+        score += 8.0
+    if "search infrastructure" in strong_evidence or "vector databases" in strong_evidence:
+        score += 6.0
+    if interest_only and not strong_evidence:
+        score = min(score, 20.0)
+    if not strong_evidence and supporting_only:
+        score = min(score, 8.0)
+    if len(strong_evidence) == 1 and not adjacent and not supporting_only:
+        score = min(score, 26.0)
 
-    # AI keyword floods on non-technical profiles are a known challenge trap.
-    if ai_skill_count >= 10 and not title_is_engineering(profile.get("current_title")):
-        raw_score *= 0.50
-
-    score = max(0.0, min(100.0, raw_score))
+    score = max(0.0, min(100.0, score))
     return {
         "score": score,
-        "cluster_scores": cluster_scores,
-        "matched_skills": matched_skills[:5],
-        "ai_skill_count": ai_skill_count,
+        "matched_skills": matched[:6],
+        "strong_evidence_skills": strong_evidence[:6],
+        "adjacent_skills": adjacent[:6],
+        "supporting_skills": supporting_only[:6],
+        "interest_only": interest_only and not strong_evidence,
     }

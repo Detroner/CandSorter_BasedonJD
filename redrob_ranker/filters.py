@@ -3,41 +3,94 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Mapping
 
-from .career_scorer import domain_score_for_text, product_ship_score
-from .utils import (
-    REFERENCE_DATE,
+from career_scorer import domain_score_for_text, product_ship_score
+from utils import (
+    INTEREST_ONLY_PATTERNS,
+    get_reference_date,
     is_consulting_company,
+    list_skill_names,
     safe_bool,
     safe_date,
+    safe_date_info,
     safe_float,
     safe_get,
     safe_int,
     text_blob,
     title_is_engineering,
+    title_is_explicitly_non_engineering,
 )
 
 
-TECHNICAL_TEXT_TERMS = [
+FOUNDING_YEAR_RE = re.compile(r"founded\s+(?:in\s+)?(20\d{2}|19\d{2})", re.IGNORECASE)
+INTEREST_ONLY_RE = re.compile("|".join(re.escape(p) for p in INTEREST_ONLY_PATTERNS), re.IGNORECASE)
+
+DIRECT_TECH_SKILLS = {
     "python",
+    "pyspark",
     "machine learning",
-    "ml",
-    "ai engineer",
-    "data scientist",
-    "backend",
-    "software",
+    "nlp",
     "retrieval",
     "ranking",
-    "recommendation",
-    "search",
-    "nlp",
-    "embedding",
-    "vector",
-    "production",
-]
+    "semantic search",
+    "faiss",
+    "vector search",
+    "backend",
+    "fastapi",
+    "django",
+    "flask",
+    "microservices",
+    "rest apis",
+    "grpc",
+}
 
 
-def _technical_evidence(blob: str) -> bool:
-    return any(term in blob for term in TECHNICAL_TEXT_TERMS) or domain_score_for_text(blob) >= 0.35
+def _structured_technical_evidence(candidate: Mapping[str, Any]) -> bool:
+    profile = safe_get(candidate, "profile", default={}) or {}
+    roles = safe_get(candidate, "career_history", default=[]) or []
+    skill_names = {name.lower() for name in list_skill_names(candidate)}
+    if title_is_engineering(profile.get("current_title", "")):
+        return True
+    if any(title_is_engineering(role.get("title", "")) for role in roles):
+        return True
+    direct_hits = DIRECT_TECH_SKILLS.intersection(skill_names)
+    if len(direct_hits) >= 3:
+        return True
+    if len(direct_hits) >= 2 and any(domain_score_for_text(str(role.get("description", ""))) >= 0.25 for role in roles):
+        return True
+    supporting_hits = skill_names.intersection({"spark", "airflow", "kafka", "apache beam", "databricks", "dbt", "hadoop"})
+    if len(supporting_hits) >= 2 and any(title_is_engineering(role.get("title", "")) for role in roles):
+        return True
+    for role in roles:
+        desc = str(role.get("description", ""))
+        if product_ship_score(desc) > 0.45 and domain_score_for_text(desc) >= 0.25:
+            return True
+    return False
+
+
+def _profile_is_inconsistent(candidate: Mapping[str, Any]) -> bool:
+    profile = safe_get(candidate, "profile", default={}) or {}
+    roles = safe_get(candidate, "career_history", default=[]) or []
+    current_title = profile.get("current_title", "")
+    if title_is_engineering(current_title) or title_is_explicitly_non_engineering(current_title):
+        title_kinds = []
+        for role in roles:
+            role_title = role.get("title", "")
+            if title_is_engineering(role_title):
+                title_kinds.append("eng")
+            elif title_is_explicitly_non_engineering(role_title):
+                title_kinds.append("non_eng")
+        if title_kinds:
+            current_kind = "eng" if title_is_engineering(current_title) else "non_eng"
+            opposite = "non_eng" if current_kind == "eng" else "eng"
+            return title_kinds.count(opposite) >= max(1, len(title_kinds))
+    return False
+
+
+def _interest_only_candidate(candidate: Mapping[str, Any]) -> bool:
+    blob = text_blob(candidate)
+    if not INTEREST_ONLY_RE.search(blob):
+        return False
+    return not _structured_technical_evidence(candidate)
 
 
 def _domain_disqualified(blob: str) -> bool:
@@ -48,7 +101,7 @@ def _domain_disqualified(blob: str) -> bool:
 
 def _duration_plausible(role: Mapping[str, Any]) -> bool:
     start = safe_date(role.get("start_date"))
-    end = safe_date(role.get("end_date")) or REFERENCE_DATE
+    end = safe_date(role.get("end_date")) or get_reference_date()
     if not start or not end or end < start:
         return False
     actual_months = max(0, (end.year - start.year) * 12 + (end.month - start.month) + 1)
@@ -58,7 +111,7 @@ def _duration_plausible(role: Mapping[str, Any]) -> bool:
 
 def _company_founding_flag(role: Mapping[str, Any]) -> bool:
     text = str(role.get("description", ""))
-    found = re.search(r"founded\s+(?:in\s+)?(20\d{2}|19\d{2})", text, flags=re.I)
+    found = FOUNDING_YEAR_RE.search(text)
     start = safe_date(role.get("start_date"))
     if not found or not start:
         return False
@@ -93,6 +146,11 @@ def honeypot_flags(candidate: Mapping[str, Any]) -> List[str]:
                 break
 
     for role in roles:
+        start_date, start_status = safe_date_info(role.get("start_date"))
+        end_date, end_status = safe_date_info(role.get("end_date"))
+        if start_status == "invalid" or end_status == "invalid":
+            flags.append("malformed career date")
+            break
         if not _duration_plausible(role):
             flags.append("implausible career date duration")
             break
@@ -128,10 +186,20 @@ def apply_filters(candidate: Mapping[str, Any], jd_config: Mapping[str, Any]) ->
     if country and country != "india" and not safe_bool(signals.get("willing_to_relocate"), False):
         reasons.append("outside India and not willing to relocate")
 
+    if _interest_only_candidate(candidate):
+        reasons.append("interest in AI/Python without execution evidence")
+
     has_technical_title = title_is_engineering(title)
     has_technical_history = any(title_is_engineering(role.get("title", "")) for role in roles)
-    if not has_technical_title and not has_technical_history and not _technical_evidence(blob):
+    has_structured_evidence = _structured_technical_evidence(candidate)
+    if not has_technical_title and not has_technical_history and not has_structured_evidence:
         reasons.append("no technical engineering evidence")
+
+    if title_is_explicitly_non_engineering(title) and not has_structured_evidence:
+        reasons.append("current role is non-engineering without technical proof")
+
+    if _profile_is_inconsistent(candidate) and not has_technical_title:
+        reasons.append("profile title/history inconsistency without technical proof")
 
     if roles:
         consulting_roles = [
@@ -140,18 +208,17 @@ def apply_filters(candidate: Mapping[str, Any], jd_config: Mapping[str, Any]) ->
             if is_consulting_company(role.get("company"), role.get("industry"))
         ]
         productish = any(product_ship_score(role.get("description")) > 0.45 for role in roles)
-        if len(consulting_roles) == len(roles) and not productish and domain_score_for_text(blob) < 0.3:
+        if len(consulting_roles) == len(roles) and not productish and domain_score_for_text(blob) < 0.35:
             reasons.append("consulting-only career without product shipping evidence")
 
     if _domain_disqualified(blob):
         reasons.append("primary domain is CV, speech, or robotics without NLP/IR exposure")
 
-    if "langchain" in blob and domain_score_for_text(blob) < 0.25 and "production" not in blob:
+    if "langchain" in blob and domain_score_for_text(blob) < 0.30 and "production" not in blob:
         reasons.append("recent framework-only AI exposure without production retrieval depth")
 
     return {
         "passed": not reasons,
-        "reason": "; ".join(reasons),
+        "reason": "; ".join(dict.fromkeys(reasons)),
         "honeypot_flags": flags,
     }
-

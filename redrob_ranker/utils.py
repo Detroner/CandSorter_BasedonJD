@@ -3,28 +3,49 @@ from __future__ import annotations
 import gzip
 import json
 import math
+import os
+import re
 import statistics
-from collections import Counter, defaultdict
+import zipfile
+from collections import Counter
 from datetime import date, datetime
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 
-REFERENCE_DATE = date(2026, 6, 10)
+_ISO_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[T\s].*)?$")
+_CANDIDATE_ID_RE = re.compile(r"^CAND_\d{7}$")
+
+INTEREST_ONLY_PATTERNS = (
+    "interested in transitioning",
+    "building competence",
+    "curious about ai",
+    "curious about how ai tools could augment",
+    "self-learner level",
+    "self-directed ml projects",
+    "learning modern ml",
+    "experimented with chatgpt",
+    "emerging ai capabilities",
+    "interested in expanding into broader backend",
+)
 
 
 def iter_candidates(path: str | Path) -> Iterator[dict]:
-    """Stream candidates from .jsonl, .jsonl.gz, or a JSON array sample file."""
     p = Path(path)
-    opener = gzip.open if p.suffix == ".gz" else open
-    if p.suffix == ".json":
+    name = p.name.lower()
+
+    if name.endswith(".json") and not name.endswith(".jsonl"):
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError(f"Expected JSON array in {p}, got {type(data).__name__}")
         for item in data:
             if item:
                 yield item
         return
 
+    opener = gzip.open if name.endswith(".gz") else open
     with opener(p, "rt", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -40,6 +61,10 @@ def safe_get(obj: Any, *keys: str, default: Any = None) -> Any:
         else:
             return default
     return default if cur is None else cur
+
+
+def valid_candidate_id(candidate_id: Any) -> bool:
+    return bool(_CANDIDATE_ID_RE.match(str(candidate_id or "").strip()))
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -83,38 +108,66 @@ def safe_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
-def safe_date(value: Any) -> Optional[date]:
-    if value is None or value == "":
-        return None
-    if isinstance(value, date) and not isinstance(value, datetime):
-        return value
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, (int, float)):
+@lru_cache(maxsize=65536)
+def _parse_date_cached(value: str) -> Optional[date]:
+    text = value.strip()
+    match = _ISO_DATE_RE.match(text)
+    if match:
+        year, month, day = (int(match.group(i)) for i in range(1, 4))
         try:
-            return datetime.utcfromtimestamp(value).date()
-        except (OverflowError, OSError, ValueError):
-            return None
-    if isinstance(value, str):
-        text = value.strip()
-        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%Y-%m", "%Y"):
-            try:
-                parsed = datetime.strptime(text[: len(fmt)], fmt)
-                return parsed.date()
-            except ValueError:
-                continue
-        try:
-            return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+            return date(year, month, day)
         except ValueError:
             return None
-    return None
+
+    for fmt in ("%Y/%m/%d", "%d-%m-%Y", "%Y-%m", "%Y"):
+        try:
+            return datetime.strptime(text[: len(fmt)], fmt).date()
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
 
 
-def days_since(value: Any, default: int = 999) -> int:
+def safe_date_info(value: Any) -> Tuple[Optional[date], str]:
+    if value is None or value == "":
+        return None, "missing"
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value, "ok"
+    if isinstance(value, datetime):
+        return value.date(), "ok"
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.utcfromtimestamp(value).date(), "ok"
+        except (OverflowError, OSError, ValueError):
+            return None, "invalid"
+    if isinstance(value, str):
+        parsed = _parse_date_cached(value)
+        return parsed, "ok" if parsed else "invalid"
+    return None, "invalid"
+
+
+def safe_date(value: Any) -> Optional[date]:
+    parsed, _ = safe_date_info(value)
+    return parsed
+
+
+def get_reference_date() -> date:
+    override = os.getenv("REDROB_REFERENCE_DATE", "").strip()
+    if override:
+        parsed = _parse_date_cached(override)
+        if parsed:
+            return parsed
+    return date.today()
+
+
+def days_since(value: Any, default: int = 999, reference_date: Optional[date] = None) -> int:
     parsed = safe_date(value)
     if not parsed:
         return default
-    return max(0, (REFERENCE_DATE - parsed).days)
+    reference = reference_date or get_reference_date()
+    return max(0, (reference - parsed).days)
 
 
 def clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -166,6 +219,11 @@ def text_blob(candidate: Mapping[str, Any]) -> str:
     return " ".join(parts).lower()
 
 
+def has_interest_only_language(text: Any) -> bool:
+    lowered = str(text or "").lower()
+    return any(pattern in lowered for pattern in INTEREST_ONLY_PATTERNS)
+
+
 ENGINEERING_TITLE_TERMS = (
     "engineer",
     "developer",
@@ -175,20 +233,48 @@ ENGINEERING_TITLE_TERMS = (
     "ml ",
     " ai ",
     "artificial intelligence",
-    "data",
-    "research",
     "backend",
     "software",
     "sde",
     "technical lead",
     "tech lead",
-    "principal",
+    "platform",
+    "data engineer",
+)
+
+
+NON_SOFTWARE_ENGINEERING_TERMS = (
+    "civil engineer",
+    "mechanical engineer",
+    "electrical engineer",
+    "chemical engineer",
+    "industrial engineer",
+)
+
+
+NON_ENGINEERING_TITLE_TERMS = (
+    "marketing",
+    "sales",
+    "hr",
+    "accountant",
+    "support",
+    "operations manager",
+    "content writer",
+    "graphic designer",
+    "business analyst",
 )
 
 
 def title_is_engineering(title: Any) -> bool:
     text = f" {str(title or '').lower()} "
+    if any(term in text for term in NON_SOFTWARE_ENGINEERING_TERMS):
+        return False
     return any(term in text for term in ENGINEERING_TITLE_TERMS)
+
+
+def title_is_explicitly_non_engineering(title: Any) -> bool:
+    text = f" {str(title or '').lower()} "
+    return any(term in text for term in NON_ENGINEERING_TITLE_TERMS)
 
 
 CONSULTING_FIRMS = {
@@ -218,7 +304,7 @@ def is_consulting_company(company: Any, industry: Any = "") -> bool:
     return any(name in company_text for name in CONSULTING_FIRMS) or "it services" in industry_text or "consulting" in industry_text
 
 
-def company_size_midpoint(size: Any) -> int:
+def company_size_midpoint(size: Any) -> Optional[int]:
     text = str(size or "").strip()
     mapping = {
         "1-10": 5,
@@ -230,7 +316,17 @@ def company_size_midpoint(size: Any) -> int:
         "5001-10000": 7500,
         "10001+": 15000,
     }
-    return mapping.get(text, 1000)
+    return mapping.get(text)
+
+
+def list_skill_names(candidate: Mapping[str, Any]) -> List[str]:
+    skills = safe_get(candidate, "skills", default=[]) or []
+    names = []
+    for skill in skills:
+        name = str(skill.get("name", "")).strip()
+        if name:
+            names.append(name)
+    return names
 
 
 def _field_values(candidate: Mapping[str, Any]) -> Dict[str, Any]:
@@ -239,6 +335,7 @@ def _field_values(candidate: Mapping[str, Any]) -> Dict[str, Any]:
     skills = safe_get(candidate, "skills", default=[]) or []
     return {
         "years_of_experience": profile.get("years_of_experience"),
+        "location": profile.get("location"),
         "github_activity_score": signals.get("github_activity_score"),
         "connection_count": signals.get("connection_count"),
         "notice_period_days": signals.get("notice_period_days"),
@@ -251,10 +348,13 @@ def _field_values(candidate: Mapping[str, Any]) -> Dict[str, Any]:
         "skill_assessment_scores": signals.get("skill_assessment_scores"),
         "skill_count": len(skills),
         "career_history": safe_get(candidate, "career_history", default=[]),
+        "education": safe_get(candidate, "education", default=[]),
     }
 
 
 def compute_prepass(path: str | Path) -> tuple[Dict[str, Dict[str, float]], "DataCompletenessReport"]:
+    # Null-rate tracking covers both continuous and structural fields like education;
+    # only the continuous subset below receives corpus mean/std statistics.
     continuous_fields = [
         "years_of_experience",
         "github_activity_score",
@@ -314,3 +414,12 @@ class DataCompletenessReport:
             return mild
         return strong
 
+    def component_active(self, field: str) -> bool:
+        return self.tier(field) != "structural"
+
+
+def extract_text_from_docx(path: str | Path) -> str:
+    with zipfile.ZipFile(path) as zf:
+        xml = zf.read("word/document.xml").decode("utf-8", errors="ignore")
+    chunks = re.findall(r"<w:t[^>]*>(.*?)</w:t>", xml)
+    return re.sub(r"\s+", " ", " ".join(chunks)).strip()

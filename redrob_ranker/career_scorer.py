@@ -1,70 +1,64 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Sequence
 
-from .utils import (
+from utils import (
+    INTEREST_ONLY_PATTERNS,
     company_size_midpoint,
+    has_interest_only_language,
     is_consulting_company,
     safe_float,
     safe_get,
     safe_int,
-    score_from_z,
     title_is_engineering,
+    title_is_explicitly_non_engineering,
 )
 
 
+_GAP = r"[\w\s,.;/\-&]{0,120}?"
+TECH_ACTIONS = r"(?:built|deployed|shipped|implemented|designed|owned|scaled|optimized|launched)"
+TECH_OBJECTS = r"(?:pipeline|service|api|model|ranking system|retrieval system|search system|backend|microservice|embedding pipeline)"
+
 PRODUCTION_PATTERNS = [
-    r"\bdeployed\b",
-    r"\bshipped\b",
-    r"\bscaled\b",
-    r"\blaunched\b",
+    rf"\b{TECH_ACTIONS}{_GAP}\b{TECH_OBJECTS}\b",
     r"reduced latency",
-    r"a/?b test",
     r"served\s+\d+",
     r"\d+\s*[kmb]\+?\s+users",
-    r"built and maintained",
-    r"\bproduction\b",
     r"real users",
-    r"end[- ]to[- ]end",
-    r"owned .* system",
-    r"improved .* metric",
 ]
 
 HIGH_DOMAIN_PATTERNS = [
-    r"built\s+[^.]{0,80}\bsearch\b",
-    r"deployed\s+[^.]{0,80}\branking\b",
-    r"shipped\s+[^.]{0,80}\brecommendation\b",
-    r"designed\s+[^.]{0,80}\bretrieval\b",
-    r"scaled\s+[^.]{0,80}\bmatching\b",
-    r"implemented\s+[^.]{0,80}\branking\b",
-    r"production\s+[^.]{0,80}\bsearch\b",
-    r"vector\s+[^.]{0,40}\bsearch\b",
-    r"embedding\s+[^.]{0,50}\bpipeline\b",
-    r"hybrid\s+[^.]{0,40}\bretrieval\b",
+    rf"\bbuilt{_GAP}\bsearch\b",
+    rf"\bdeployed{_GAP}\branking\b",
+    rf"\bdesigned{_GAP}\bretrieval\b",
+    rf"\bimplemented{_GAP}\branking\b",
+    rf"\bvector{_GAP}\bsearch\b",
+    rf"\bembedding{_GAP}\bpipeline\b",
+    rf"\bhybrid{_GAP}\bretrieval\b",
     r"candidate[- ]jd matching",
 ]
 
 MEDIUM_DOMAIN_PATTERNS = [
-    r"search relevance",
     r"ranking system",
     r"recommendation engine",
     r"recommender system",
     r"retrieval pipeline",
-    r"a/?b test[^.]{0,80}ranking",
     r"\bsemantic search\b",
     r"\bdense retrieval\b",
     r"\blearning[- ]to[- ]rank\b",
     r"\bquery understanding\b",
     r"\bmatching system\b",
+    r"\benterprise search\b",
 ]
 
 EXCLUDED_DOMAIN_PATTERNS = [
     r"searched for",
     r"search for data",
-    r"data entry",
-    r"searched records",
-    r"searching records",
+    r"search keywords",
+    r"seo strategy",
+    r"ranked on the first page of search",
+    r"content creation",
 ]
 
 TECH_INDUSTRIES = [
@@ -82,30 +76,49 @@ TECH_INDUSTRIES = [
 ]
 
 
-def _matches(patterns: List[str], text: str) -> int:
-    return sum(1 for pattern in patterns if re.search(pattern, text, flags=re.I))
+def _compile(patterns: Sequence[str]) -> tuple[re.Pattern[str], ...]:
+    return tuple(re.compile(pattern, re.IGNORECASE) for pattern in patterns)
+
+
+PRODUCTION_COMPILED = _compile(PRODUCTION_PATTERNS)
+HIGH_DOMAIN_COMPILED = _compile(HIGH_DOMAIN_PATTERNS)
+MEDIUM_DOMAIN_COMPILED = _compile(MEDIUM_DOMAIN_PATTERNS)
+INTEREST_ONLY_COMPILED = _compile(INTEREST_ONLY_PATTERNS)
+EXCLUDED_DOMAIN_COMPILED = _compile(EXCLUDED_DOMAIN_PATTERNS)
+
+
+def _matches(compiled: Sequence[re.Pattern[str]], text: str) -> int:
+    return sum(1 for pattern in compiled if pattern.search(text))
 
 
 def product_ship_score(description: Any) -> float:
     text = str(description or "").lower()
     if not text:
         return 0.0
-    hits = _matches(PRODUCTION_PATTERNS, text)
-    return min(1.0, hits / 3.0)
+    if any(pattern.search(text) for pattern in INTEREST_ONLY_COMPILED):
+        return 0.0
+    hits = _matches(PRODUCTION_COMPILED, text)
+    return min(1.0, hits / 2.0)
 
 
 def domain_score_for_text(text: str) -> float:
     lowered = text.lower()
-    if any(re.search(pattern, lowered, flags=re.I) for pattern in EXCLUDED_DOMAIN_PATTERNS):
+    if any(pattern.search(lowered) for pattern in EXCLUDED_DOMAIN_COMPILED):
         return 0.0
-    high = _matches(HIGH_DOMAIN_PATTERNS, lowered)
-    medium = _matches(MEDIUM_DOMAIN_PATTERNS, lowered)
+    if any(pattern.search(lowered) for pattern in INTEREST_ONLY_COMPILED):
+        return 0.0
+    high = _matches(HIGH_DOMAIN_COMPILED, lowered)
+    medium = _matches(MEDIUM_DOMAIN_COMPILED, lowered)
     broad = sum(
         1
-        for term in ["retrieval", "ranking", "recommendation", "relevance", "matching", "embeddings", "vector search"]
+        for term in ["retrieval", "ranking", "recommendation", "matching", "embeddings", "vector search"]
         if term in lowered
     )
-    return min(1.0, high * 0.40 + medium * 0.22 + min(0.25, broad * 0.06))
+    action = 1 if re.search(rf"\b{TECH_ACTIONS}\b", lowered) else 0
+    substance = high * 0.45 + medium * 0.18 + min(0.12, broad * 0.03) + action * 0.12
+    if action == 0 and high == 0:
+        substance = min(substance, 0.18)
+    return min(1.0, substance)
 
 
 def _role_is_productish(role: Mapping[str, Any]) -> bool:
@@ -114,7 +127,7 @@ def _role_is_productish(role: Mapping[str, Any]) -> bool:
     size = company_size_midpoint(role.get("company_size"))
     if any(term in industry for term in TECH_INDUSTRIES):
         return True
-    if size <= 500 and not is_consulting_company(company, industry):
+    if size is not None and size <= 500 and not is_consulting_company(company, industry) and title_is_engineering(role.get("title", "")):
         return True
     return product_ship_score(role.get("description")) > 0.4 and not is_consulting_company(company, industry)
 
@@ -127,26 +140,23 @@ def score_experience(candidate: Mapping[str, Any], jd_config: Mapping[str, Any],
         band = 1.0
     elif exp_min - 1 <= years <= exp_max + 1:
         band = 0.90
-    elif exp_min - 2 <= years <= exp_max + 3:
-        band = 0.75
-    elif 2.5 <= years <= 14:
-        band = 0.58
+    elif exp_min - 2 <= years <= exp_max + 2:
+        band = 0.68
+    elif exp_min - 3 <= years <= exp_max + 4:
+        band = 0.42
     else:
-        band = 0.35
-    stats = corpus_stats.get("years_of_experience", {"mean": 0.0, "std": 1.0})
-    z_band = score_from_z(years, stats["mean"], stats["std"])
-    return 100.0 * (0.78 * band + 0.22 * z_band)
+        band = 0.18
+    return 100.0 * band
 
 
 def score_career(candidate: Mapping[str, Any], jd_config: Mapping[str, Any]) -> Dict[str, Any]:
     profile = safe_get(candidate, "profile", default={}) or {}
     roles = safe_get(candidate, "career_history", default=[]) or []
     current_title = profile.get("current_title", "")
-    current_company = profile.get("current_company", "")
     current_industry = profile.get("current_industry", "")
     years = safe_float(profile.get("years_of_experience"), 0.0)
 
-    score = 20.0
+    score = 15.0
     reasons: List[str] = []
     domain_roles = 0
     total_domain = 0.0
@@ -157,12 +167,16 @@ def score_career(candidate: Mapping[str, Any], jd_config: Mapping[str, Any]) -> 
     technical_roles = 0
     recent_short_roles = 0
     domain_terms: List[str] = []
+    interest_only_roles = 0
+    required_skills = {str(skill).lower() for skill in (jd_config.get("required_skills") or [])}
 
     if title_is_engineering(current_title):
-        score += 13
+        score += 12.0
         technical_roles += 1
-    else:
-        score -= 12
+    elif title_is_explicitly_non_engineering(current_title):
+        score -= 10.0
+    current_kind = "eng" if title_is_engineering(current_title) else "non_eng" if title_is_explicitly_non_engineering(current_title) else "unknown"
+    opposite_title_roles = 0
 
     for role in roles:
         title = str(role.get("title", ""))
@@ -171,69 +185,97 @@ def score_career(candidate: Mapping[str, Any], jd_config: Mapping[str, Any]) -> 
 
         if title_is_engineering(title):
             technical_roles += 1
-            score += 2.5
+            score += 3.0
+            if current_kind == "non_eng":
+                opposite_title_roles += 1
+        elif title_is_explicitly_non_engineering(title):
+            score -= 1.5
+            if current_kind == "eng":
+                opposite_title_roles += 1
+
+        if has_interest_only_language(text):
+            interest_only_roles += 1
 
         if _role_is_productish(role):
             product_roles += 1
-            score += 5.0
+            score += 4.0
 
         if is_consulting_company(role.get("company"), role.get("industry")):
             consulting_roles += 1
 
-        if company_size_midpoint(role.get("company_size")) <= 200:
+        role_size = company_size_midpoint(role.get("company_size"))
+        if role_size is not None and role_size <= 200:
             startup_roles += 1
-            score += 2.0
+            score += 1.5
 
         ship = product_ship_score(desc)
         if ship > 0:
             production_roles += 1
-            score += 10.0 * ship
+            score += 8.0 * ship
 
         role_domain = domain_score_for_text(text)
         if role_domain > 0:
             domain_roles += 1
             total_domain += role_domain
-            score += 13.0 * role_domain
+            score += 12.0 * role_domain
             for term in ["retrieval", "ranking", "recommendation", "search", "matching", "embedding"]:
                 if term in text and term not in domain_terms:
                     domain_terms.append(term)
 
+        jd_overlap = sum(1 for term in required_skills if term and re.search(rf"\b{re.escape(term)}\b", text))
+        if jd_overlap:
+            score += min(8.0, jd_overlap * 2.0)
+
         title_lower = title.lower()
         if any(term in title_lower for term in ["founding", "lead", "principal", "staff", "head", "architect"]):
-            score += 4.0
+            score += 3.0
         if safe_int(role.get("duration_months"), 0) < 18:
             recent_short_roles += 1
 
-    if domain_roles >= 2 and total_domain >= 0.4:
-        score += 16.0
+    if domain_roles >= 2 and total_domain >= 0.45:
+        score += 14.0
         reasons.append("multi-role search/ranking evidence")
-    elif domain_roles == 1 and total_domain >= 0.65 and production_roles:
-        score += 8.0
+    elif domain_roles == 1 and total_domain >= 0.70 and production_roles:
+        score += 7.0
         reasons.append("strong single-role domain evidence")
 
     if product_roles:
         reasons.append("product-company exposure")
     if production_roles:
         reasons.append("production shipping evidence")
-    if startup_roles:
-        reasons.append("startup-sized team exposure")
 
-    if roles and consulting_roles == len(roles) and production_roles == 0:
-        score -= 22.0
-    elif roles and consulting_roles == len(roles):
-        score -= 9.0
+    jd_text = str(jd_config.get("text", "")).lower()
+    consulting_penalty_enabled = (
+        "consulting firm" in jd_text
+        or "consulting-only" in jd_text
+        or "not preferred consulting" in jd_text
+        or any(name in jd_text for name in ["tcs", "infosys", "wipro", "accenture", "cognizant", "capgemini"])
+    )
+    if consulting_penalty_enabled and roles and consulting_roles == len(roles) and production_roles == 0:
+        score -= 18.0
+    elif consulting_penalty_enabled and roles and consulting_roles == len(roles):
+        score -= 7.0
 
     if len(roles) >= 3 and recent_short_roles >= 3 and years < 6:
-        score -= 9.0
+        score -= 8.0
 
-    if production_roles == 0:
+    if roles and opposite_title_roles >= max(1, len(roles) // 2):
         score -= 10.0
 
-    if product_roles == 0 and company_size_midpoint(profile.get("current_company_size")) > 10000:
-        score -= 5.0
+    if production_roles == 0:
+        score -= 8.0
+
+    if technical_roles == 0:
+        score -= 18.0
+
+    if interest_only_roles and technical_roles == 0 and domain_roles == 0:
+        score -= 10.0
+
+    if technical_roles < 1 and domain_roles < 1 and product_roles < 1:
+        score -= 10.0
 
     if any(term in f"{current_title} {current_industry}".lower() for term in ["research", "academic"]) and production_roles == 0:
-        score -= 14.0
+        score -= 10.0
 
     score = max(0.0, min(100.0, score))
     return {
@@ -246,7 +288,6 @@ def score_career(candidate: Mapping[str, Any], jd_config: Mapping[str, Any]) -> 
         "consulting_roles": consulting_roles,
         "startup_roles": startup_roles,
         "technical_roles": technical_roles,
+        "interest_only_roles": interest_only_roles,
         "reasons": reasons[:4],
-        "current_company": current_company,
     }
-
